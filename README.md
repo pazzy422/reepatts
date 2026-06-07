@@ -1,8 +1,10 @@
 # reepatts
 
-A static analyzer for **reentrancy patterns in deployed EVM bytecode**, built for the [Pharos Network](https://pharos.xyz). Give it a contract address on Pharos Atlantic Testnet or Pacific Ocean Mainnet, and it returns a per-finding report of every suspicious `SLOAD-CALL-SSTORE` fingerprint in the bytecode — with the byte offset, the function selector, a severity (0-100), and a recommended fix.
+A static analyzer for **reentrancy patterns in deployed EVM bytecode**, built for the [Pharos Network](https://pharos.xyz). Point it at a contract on Pharos Atlantic Testnet or Pacific Ocean Mainnet and it returns a per-finding report of every suspicious `SLOAD-CALL-SSTORE` fingerprint in the bytecode — byte offset, function selector, severity (0-100), and a recommended fix.
 
-Ships as a [Pharos Agent Center](https://www.pharos.xyz/agent-center) skill — drop it into Claude / Codex / OpenClaw and the agent can audit any Pharos contract on demand.
+Six patterns matched: textbook `SLOAD-CALL-SSTORE`, `CALLCODE`/`DELEGATECALL` variants, the 2016-DAO shape `SLOAD-CALL-SLOAD-SSTORE`, cross-function chains, and unprotected `withdraw()`. The matcher is PUSH-data aware (no false-positive on slot bytes that happen to be `0x00`) and recognizes OpenZeppelin's `ReentrancyGuard` so guarded contracts don't false-flag.
+
+Drop `SKILL.md` into your agent's skills directory and the agent can audit any Pharos contract on demand. Works with Claude Code, Codex, OpenClaw, and the Pharos Agent Center.
 
 ## What it detects
 
@@ -172,12 +174,12 @@ pip install web3
 
 | Framework | Compatible? | How to use |
 |---|---|---|
-| Pharos Agent Center (official) | ✅ yes | drop `SKILL.md` into `~/.pharos/skills/reepatts/` |
-| Claude Code | ✅ yes | drop `SKILL.md` into `~/.claude/skills/` |
-| Codex | ✅ yes | drop `SKILL.md` into `~/.codex/skills/` |
+| Pharos Agent Center | ✅ yes | `cp -r . ~/.pharos/skills/reepatts` (or symlink) |
+| Claude Code | ✅ yes | `cp -r . ~/.claude/skills/reepatts` |
+| Codex | ✅ yes | `cp -r . ~/.codex/skills/reepatts` |
 | OpenClaw | ✅ yes | `npx skills add https://github.com/pazzy422/reepatts` |
 | Raw CLI / cron | ✅ yes | `bash scripts/scan.sh 0x...` — no agent needed |
-| Any agent that reads SKILL.md | ✅ yes | triggers on "audit", "reentrancy", "scan this contract" |
+| Any agent that reads SKILL.md | ✅ yes | description front-matter triggers on "reentrancy", "scan", "audit" |
 
 ## Tests
 
