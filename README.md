@@ -27,21 +27,99 @@ Each finding is reported with:
 
 ## Install
 
+### 1. Install Foundry (the engine the skill is built on)
+
 ```bash
-# Option A — git clone
-git clone https://github.com/pazzy422/reepatts.git
-cd reepatts
-chmod +x scripts/scan.sh scripts/scan_demo.sh
-pip install web3            # only for the Python version
-
-# Option B — one-line via OpenClaw
-npx skills add https://github.com/pazzy422/reepatts
-
-# Or: install as a Pharos Agent Center / Claude Code / Codex / OpenClaw skill
-mkdir -p ~/.pharos/skills
-cp -r . ~/.pharos/skills/reepatts
+curl -L https://foundry.paradigm.xyz | bash
+foundryup
 ```
 
+Verify with `cast --version`. This gives you `cast`, `forge`, `anvil`, and `chisel` on your `$PATH`. The skill uses `cast` for every RPC read.
+
+### 2. Install jq (used to parse JSON)
+
+```bash
+# macOS
+brew install jq
+# Debian/Ubuntu/Termux
+apt install -y jq
+# Alpine
+apk add jq
+```
+
+Verify with `jq --version`.
+
+### 3. Get the skill
+
+```bash
+git clone https://github.com/pazzy422/reepatts
+cd reepatts
+chmod +x scripts/*.sh
+```
+
+That's it. No `pip install`, no `npm install`, no `forge build`, no compile. The skill is a bash script that uses `cast` (from Foundry) for every RPC read. The `assets/networks.json` file already knows the Pharos Pacific Mainnet and Atlantic Testnet endpoints.
+## Quick test (try it in 30 seconds)
+
+After the 3-step install above, run the demo mode (no private key, no RPC, no setup):
+
+```bash
+bash scripts/scan.sh 0xYOUR_CONTRACT
+```
+
+You should see a printed report. The demo uses synthetic data, so it works offline.
+
+To run a real check on a Pharos transaction, wallet, or token, replace the placeholder:
+
+```bash
+bash scripts/scan.sh 0xYOUR_CONTRACT --network mainnet --format md
+```
+
+## Use in an AI agent (Claude Code / Codex / OpenClaw / Pharos Agent Center)
+
+The skill ships with a `SKILL.md` that AI agents auto-load. Once installed in your agent, just ask in natural language — the agent will read `SKILL.md` and run the bash script for you.
+
+```text
+"Is this Pharos contract 0xabc... safe from reentrancy?"
+```
+
+The agent will run `bash scripts/scan.sh 0xYOUR_CONTRACT` (or the live command with the address you gave) and read the result back to you.
+
+### Install in your agent
+
+**Option A — Pharos Agent Center** (one-line install):
+
+```bash
+# from inside any agent that has the Pharos Agent Center CLI
+pharos-skill install https://github.com/pazzy422/reepatts
+```
+
+**Option B — OpenClaw / Claude Code / Codex** (one-line via npm):
+
+```bash
+npx skills add https://github.com/pazzy422/reepatts
+```
+
+**Option C — Manual install** (drop into your agent's skills directory):
+
+```bash
+# Clone the skill
+git clone https://github.com/pazzy422/reepatts
+cd reepatts
+
+# Claude Code: copy to ~/.claude/skills/
+mkdir -p ~/.claude/skills/reepatts
+cp -r . ~/.claude/skills/reepatts/
+
+# Codex: copy to ~/.codex/skills/
+mkdir -p ~/.codex/skills/reepatts
+cp -r . ~/.codex/skills/reepatts/
+
+# OpenClaw: copy to ~/.openclaw/skills/
+mkdir -p ~/.openclaw/skills/reepatts
+cp -r . ~/.openclaw/skills/reepatts/
+
+# Then restart the agent — the skill will be auto-loaded.
+```
 ## Quick start
 
 ### Zero-dependency (bash + curl only)
