@@ -1,12 +1,12 @@
 ---
 name: reepatts
 description: Static analyzer for reentrancy patterns in deployed EVM bytecode. Given a contract address on Pharos (Atlantic Testnet or Pacific Mainnet), reepatts fetches the deployed bytecode via eth_getCode, runs a pattern-matcher that finds the canonical reentrancy fingerprint (CALL/STATICCALL/DELEGATECALL opcode followed by an SSTORE to a state variable that was loaded via SLOAD before the CALL in the same basic-block), and reports each finding with: opcode offset, the matching pattern name, a severity (0-100), the function selector it lives in, and a recommended fix. Read-only — no private key required. Use whenever the user asks "is this contract safe from reentrancy?", "scan this contract for reentrancy", "audit this contract", or provides a Pharos contract address to review.
-version: 1.0.0
+version: 2.0.0
 author: pazzy422
 tags: [pharos, security, audit, reentrancy, evm, bytecode, static-analysis, mainnet, testnet]
 agents: [claude, codex, openclaw, gemini]
 requires: read
-bins: [python3]
+bins: [bash, cast, jq]
 ---
 
 
