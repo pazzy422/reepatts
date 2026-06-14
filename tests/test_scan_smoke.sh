@@ -1,25 +1,63 @@
 #!/bin/bash
-# reepatts — Foundry-port smoke test (v2.0.0)
-# Verifies the CLI parses, the demo mode works without cast, and the JSON output validates.
-set -e
+# Smoke test for reepatts (Foundry/bash port, v2.0.0).
+# Verifies the CLI parses, help text works offline, demo runs offline, and error paths are clear.
+set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="$(dirname "$SCRIPT_DIR")"
 SCRIPT="$SKILL_DIR/scripts/scan.sh"
 
-echo "Test 1: --help works"
-bash "$SCRIPT" --help >/dev/null 2>&1 || true
-echo "  OK"
+PASS=0
+FAIL=0
 
-echo "Test 2: --demo works"
-if bash "$SCRIPT" --demo 2>&1 | grep -qiE "demo|ok|verdict|score|forecast|signal|SAFE|wallet|sweep|iter|audit|report"; then
-  echo "  OK: demo produced output"
+run() {
+  local name="$1"
+  local expected="$2"
+  shift 2
+  local out
+  out=$(bash "$SCRIPT" "$@" 2>&1 || true)
+  if echo "$out" | grep -qF -- "$expected"; then
+    echo "  OK: $name"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $name"
+    echo "       expected substring: $expected"
+    echo "       actual: $(echo "$out" | head -3)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+echo "Test 1: --help works (no cast required)"
+run "help text present" "Usage:" --help
+
+echo "Test 2: --demo works (no cast required)"
+run "demo mode produced output" "DEMO" --demo
+
+echo "Test 3: no contract shows usage"
+run "no-contract shows usage" "0xCONTRACT required"
+
+echo "Test 4: bad address format rejected"
+run "bad address rejected" "Unknown arg" not-hex
+
+echo "Test 5: bad format rejected"
+run "bad format rejected" "format must be md|json|txt" \
+  0x1234567890123456789012345678901234567890 --format xml
+
+echo "Test 6: bad min-severity rejected"
+run "bad min-severity rejected" "must be 0-100" \
+  0x1234567890123456789012345678901234567890 --min-severity 200
+
+echo "Test 7: bad network rejected"
+run "bad network rejected" "unknown network" \
+  0x1234567890123456789012345678901234567890 --network bogus
+
+echo "Test 8: cast-missing error is clear (only when cast is not installed)"
+if ! command -v cast >/dev/null 2>&1; then
+  run "cast-missing error clear" "not found" \
+    0x1234567890123456789012345678901234567890
 else
-  echo "  WARN: demo mode output unexpected (skill may not support --demo)"
+  echo "  SKIP: cast is installed"
 fi
 
-echo "Test 3: --help is human-readable"
-if bash "$SCRIPT" --help 2>&1 | head -5 | grep -qiE "usage|Usage|options|examples|bash scripts"; then
-  echo "  OK: help text present"
-fi
-
-echo "All smoke tests passed."
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" = "0" ] || exit 1

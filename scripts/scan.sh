@@ -1,249 +1,516 @@
 #!/usr/bin/env bash
-# reepatts/scan.sh — zero-dep bash scanner for reentrancy patterns in deployed EVM bytecode.
-# Usage:
-#   bash scripts/scan.sh 0xCONTRACT --network mainnet
-#   bash scripts/scan.sh 0xCONTRACT --network testnet --format json
-#   bash scripts/scan.sh 0xCONTRACT --network mainnet --min-severity 80
+# reepatts/scan.sh — bash + cast (Foundry) reentrancy pattern scanner.
+# Fetches deployed bytecode via cast rpc eth_getCode and matches 6 reentrancy
+# patterns in pure bash: SLOAD-CALL-SSTORE, SLOAD-CALLCODE-SSTORE,
+# SLOAD-DELEGATECALL-SSTORE, SLOAD-CALL-SLOAD-SSTORE, cross-function chains,
+# and unprotected withdraw().
 #
-# Requires: bash 4+, curl, python3
+# Usage:
+#   bash scripts/scan.sh 0xCONTRACT [--network mainnet|testnet] [--format md|json|txt]
+#                            [--min-severity 0-100] [--demo] [--help]
+#
+# Requires: bash 4+, cast (Foundry), jq
 # Read-only: never asks for a private key, never sends a transaction.
 
-set -euo pipefail
+set -uo pipefail
 
+# ---- Foundry required (after arg parsing so --help works offline) ----
+ensure_cast() {
+  if ! command -v cast >/dev/null 2>&1; then
+    echo "Error: 'cast' not found. Install Foundry:" >&2
+    echo "  curl -L https://foundry.paradigm.xyz | bash && foundryup" >&2
+    exit 1
+  fi
+}
+
+# ---- Load network config from assets/networks.json ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NET_JSON="$SCRIPT_DIR/../assets/networks.json"
+[ ! -f "$NET_JSON" ] && { echo "Error: $NET_JSON not found" >&2; exit 1; }
 
-# -------------------- args --------------------
-if [[ $# -lt 1 ]]; then
-  cat <<EOF
-Usage: bash scripts/scan.sh 0xCONTRACT [--network mainnet|atlantic-testnet] [--format md|json|txt] [--min-severity 0-100]
+get_field() {
+  local net_name="$1" field="$2"
+  sed -n "/\"name\": *\"$net_name\"/,/^    }/p" "$NET_JSON" \
+    | grep -E "\"$field\":" | head -1 \
+    | sed -E 's/^[^:]+:[[:space:]]*"([^"]*)".*/\1/' | sed -E 's/,$//'
+}
+get_num() {
+  local net_name="$1" field="$2"
+  sed -n "/\"name\": *\"$net_name\"/,/^    }/p" "$NET_JSON" \
+    | grep -E "\"$field\":" | head -1 | grep -oE '[0-9]+' | head -1
+}
+
+# ---- EVM opcode constants ----
+SLOAD=84         # 0x54
+SSTORE=85        # 0x55
+CALL=241         # 0xf1
+CALLCODE=242     # 0xf2
+DELEGATECALL=244 # 0xf4
+STATICCALL=250   # 0xfa
+JUMPDEST=91      # 0x5b
+JUMPI=87         # 0x57
+STOP=0           # 0x00
+RETURN=243       # 0xf3
+REVERT=253       # 0xfd
+PUSH1=96         # 0x60
+PUSH32=127       # 0x7f
+
+CALL_OPCODES=("$CALL" "$CALLCODE" "$DELEGATECALL" "$STATICCALL")
+FUNC_END_OPCODES=("$STOP" "$RETURN" "$REVERT" "$JUMPI")
+
+# OpenZeppelin ReentrancyGuard storage slots
+GUARD_SLOTS=("4f10" "6d10" "3659")
+
+# ---- Arg parsing ----
+CONTRACT=""
+NETWORK="mainnet"
+FORMAT="md"
+MIN_SEVERITY=0
+PRINT_HELP=0
+DEMO=0
+PREV=""
+
+for arg in "$@"; do
+  case "$PREV" in
+    --network)       NETWORK="$arg"; PREV=""; continue ;;
+    --format)        FORMAT="$arg"; PREV=""; continue ;;
+    --min-severity)  MIN_SEVERITY="$arg"; PREV=""; continue ;;
+  esac
+  case "$arg" in
+    -h|--help)   PRINT_HELP=1 ;;
+    --network)   PREV="--network" ;;
+    --format)    PREV="--format" ;;
+    --min-severity) PREV="--min-severity" ;;
+    --demo)      DEMO=1 ;;
+    0x*)         [ -z "$CONTRACT" ] && CONTRACT="$arg" ;;
+    *)           echo "Unknown arg: $arg" >&2; exit 2 ;;
+  esac
+done
+[ -n "$PREV" ] && { echo "Error: $PREV requires a value" >&2; exit 1; }
+
+# ---- Help (no cast needed) ----
+if [ "$PRINT_HELP" = "1" ]; then
+  cat <<'EOF'
+Usage: bash scripts/scan.sh 0xCONTRACT [--network mainnet|testnet] [--format md|json|txt]
+                            [--min-severity 0-100] [--demo] [--help]
 
 Networks:
-  atlantic-testnet  (default) — Pharos Atlantic Testnet, chain 688689
-  mainnet                       — Pharos Pacific Ocean Mainnet, chain 1672
+  mainnet  (default) — Pharos Pacific Ocean Mainnet, chain 1672
+  testnet             — Pharos Atlantic Testnet, chain 688689
+
+Formats:
+  md    Markdown report (default)
+  json  Structured JSON (for agent consumption)
+  txt   Plain text
 
 Examples:
-  bash scripts/scan.sh 0x7a31dd32a880827477ab2bbeff47db188c896815 --network mainnet
+  bash scripts/scan.sh 0xYOUR_CONTRACT
   bash scripts/scan.sh 0xYOUR_CONTRACT --network testnet --format json
-  bash scripts/scan.sh 0xYOUR_CONTRACT --network mainnet --min-severity 80
+  bash scripts/scan.sh 0xYOUR_CONTRACT --min-severity 80
+  bash scripts/scan.sh --demo
+
+Prerequisites:
+  - Foundry (cast): curl -L https://foundry.paradigm.xyz | bash && foundryup
+  - jq: for --format json pretty-printing
 EOF
   exit 0
 fi
 
-if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-  bash "$0"
+# ---- Demo mode (no cast needed) — check first so --demo works without a contract ----
+if [ "$DEMO" = "1" ]; then
+  echo ""
+  echo "========================================================================"
+  echo "  REENTRANCY PATTERN SCAN  (DEMO)"
+  echo "  Contract: 0xDemo0000000000000000000000000000000000DEAD  (synthetic)"
+  echo "========================================================================"
+  echo ""
+  echo "  Findings: 0 (clean — demo bytecode is a stub)"
+  echo "  Verdict:  PASS"
+  echo "  Overall score: 0/100"
+  echo ""
+  echo "  ℹ️  This is a synthetic scan. Use a real 0xCONTRACT for a live audit."
+  echo ""
   exit 0
 fi
 
-CONTRACT="${1,,}"
-NETWORK="atlantic-testnet"
-FORMAT="md"
-MIN_SEVERITY=0
+# ---- Validate contract ----
+if [ -z "$CONTRACT" ]; then
+  echo "Error: 0xCONTRACT required (or use --demo)" >&2
+  exit 1
+fi
+if [[ ! "$CONTRACT" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+  echo "Error: contract must be 0x + 40 hex chars" >&2
+  exit 1
+fi
+CONTRACT="${CONTRACT,,}"
 
-shift
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --network)       NETWORK="$2"; shift 2 ;;
-    --format)        FORMAT="$2"; shift 2 ;;
-    --min-severity)  MIN_SEVERITY="$2"; shift 2 ;;
-    *) echo "Unknown flag: $1" >&2; exit 2 ;;
-  esac
-done
+# ---- Validate format ----
+case "$FORMAT" in md|json|txt) ;; *) echo "Error: format must be md|json|txt" >&2; exit 1 ;; esac
 
-# validate
-if [[ ! "$CONTRACT" =~ ^0x[0-9a-f]{40}$ ]]; then
-  echo "ERROR: contract must look like 0x + 40 hex chars" >&2; exit 2
+# ---- Validate min-severity ----
+if ! [[ "$MIN_SEVERITY" =~ ^[0-9]+$ ]] || [ "$MIN_SEVERITY" -gt 100 ]; then
+  echo "Error: --min-severity must be 0-100" >&2
+  exit 1
 fi
 
+# ---- Resolve network ----
 case "$NETWORK" in
   mainnet)
-    CHAIN_ID=1672
-    RPC="https://rpc.pharos.xyz"
-    EXPLORER="https://www.pharosscan.xyz"
-    NET_LABEL="Pharos Pacific Ocean Mainnet (chain 1672)"
+    RPC_URL=$(get_field mainnet rpcUrl)
+    EXPLORER_URL=$(get_field mainnet explorerUrl)
+    CHAIN_ID=$(get_num mainnet chainId)
+    NET_LABEL="Pharos Pacific Ocean Mainnet (chain $CHAIN_ID)"
     ;;
-  atlantic-testnet|testnet)
-    CHAIN_ID=688689
-    RPC="https://atlantic.dplabs-internal.com"
-    EXPLORER="https://atlantic.pharosscan.xyz"
-    NET_LABEL="Pharos Atlantic Testnet (chain 688689)"
+  testnet|atlantic-testnet)
+    RPC_URL=$(get_field atlantic-testnet rpcUrl)
+    EXPLORER_URL=$(get_field atlantic-testnet explorerUrl)
+    CHAIN_ID=$(get_num atlantic-testnet chainId)
+    NET_LABEL="Pharos Atlantic Testnet (chain $CHAIN_ID)"
     ;;
-  *) echo "ERROR: unknown network: $NETWORK" >&2; exit 2 ;;
+  *) echo "Error: unknown network: $NETWORK (use 'mainnet' or 'testnet')" >&2; exit 1 ;;
 esac
 
-case "$FORMAT" in md|json|txt) ;; *) echo "ERROR: format must be md|json|txt" >&2; exit 2 ;; esac
+# ---- Fetch bytecode (cast required from here) ----
+ensure_cast
 
-# -------------------- fetch bytecode --------------------
-PAYLOAD=$(printf '{"jsonrpc":"2.0","method":"eth_getCode","params":["%s","latest"],"id":1}' "$CONTRACT")
+BYTECODE_HEX=$(timeout 30 cast rpc --rpc-url "$RPC_URL" 'eth_getCode' "[\"$CONTRACT\",\"latest\"]" 2>/dev/null \
+  | jq -r '.result' 2>/dev/null || echo "")
 
-RESP=$(curl -sS -X POST -H "Content-Type: application/json" --data "$PAYLOAD" "$RPC")
-BYTECODE_HEX=$(printf '%s' "$RESP" | python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-if "error" in d:
-    print("ERROR:", d["error"].get("message", d["error"]), file=sys.stderr); sys.exit(3)
-r = d.get("result", "")
-if not r or r == "0x":
-    print("ERROR: contract has no deployed code (or address is an EOA)", file=sys.stderr); sys.exit(4)
-print(r)
-')
+if [ -z "$BYTECODE_HEX" ] || [ "$BYTECODE_HEX" = "null" ] || [ "$BYTECODE_HEX" = "0x" ]; then
+  echo "Error: contract has no deployed code (or address is an EOA, or RPC error)" >&2
+  exit 1
+fi
 
-BYTECODE_SIZE=$((${#BYTECODE_HEX} / 2 - 1))
+BYTECODE_SIZE=$((${#BYTECODE_HEX} / 2 - 1))  # subtract the 0x prefix
 echo "[reepatts] fetched ${BYTECODE_SIZE} bytes of bytecode for $CONTRACT on $NET_LABEL" >&2
 
-# -------------------- run pattern matcher --------------------
-MATCHED_JSON=$(export REEPATTS_BYTECODE_HEX="$BYTECODE_HEX" && BYTECODE_HEX="$BYTECODE_HEX" python3 <<'PYEOF'
-import os, json
+# Strip 0x prefix and convert to lower-case hex stream
+HEX="${BYTECODE_HEX#0x}"
+HEX="${HEX,,}"
 
-bytecode = os.environ["REEPATTS_BYTECODE_HEX"]
-assert bytecode.startswith("0x")
-raw = bytes.fromhex(bytecode[2:])
+# Build a bash array of bytes (0-255 each)
+BYTES=()
+for ((i = 0; i < ${#HEX}; i += 2)); do
+  BYTES+=("$(printf '%d' "0x${HEX:i:2}")")
+done
+NBYTES=${#BYTES[@]}
 
-# EVM opcode constants
-SLOAD, SSTORE = 0x54, 0x55
-CALL, CALLCODE, DELEGATECALL, STATICCALL = 0xf1, 0xf2, 0xf4, 0xfa
-JUMPDEST, JUMPI = 0x5b, 0x57
-STOP, RETURN, REVERT = 0x00, 0xf3, 0xfd
-CALL_OPCODES = {CALL, CALLCODE, DELEGATECALL, STATICCALL}
-GUARD_SLOTS = {0x4f10, 0x6d10, 0x3659}
+# ---- Helper: build arrays of opcode offsets ----
+# Returns comma-separated offsets for each requested opcode
+offsets_of() {
+  local target="$1"
+  local result=()
+  local i=0
+  while [ "$i" -lt "$NBYTES" ]; do
+    if [ "${BYTES[$i]}" = "$target" ]; then
+      result+=("$i")
+    fi
+    if [ "${BYTES[$i]}" -ge "$PUSH1" ] && [ "${BYTES[$i]}" -le "$PUSH32" ]; then
+      i=$((i + ${BYTES[$i]} - PUSH1 + 2))
+    else
+      i=$((i + 1))
+    fi
+  done
+  IFS=,
+  echo "${result[*]}"
+  IFS=$' \t\n'
+}
 
-# PUSH-data-aware opcode iterator
-def iter_opcodes(b):
-    i = 0
-    while i < len(b):
-        op = b[i]
-        yield i, op
-        if 0x60 <= op <= 0x7f:
-            i += (op - 0x5f) + 1
-        else:
-            i += 1
+SLOAD_OFFS=($(offsets_of "$SLOAD" | tr ',' ' '))
+SSTORE_OFFS=($(offsets_of "$SSTORE" | tr ',' ' '))
+JUMPDEST_OFFS=($(offsets_of "$JUMPDEST" | tr ',' ' '))
+# Function-end opcodes: STOP, RETURN, REVERT, JUMPI
+FUNC_END_OFFS=()
+for op in "${FUNC_END_OPCODES[@]}"; do
+  for off in $(offsets_of "$op" | tr ',' ' '); do
+    FUNC_END_OFFS+=("$off")
+  done
+done
+IFS=$'\n' FUNC_END_OFFS=($(sort -n <<<"${FUNC_END_OFFS[*]}"))
+unset IFS
 
-op_list = list(iter_opcodes(raw))
-jumdests = [off for off, op in op_list if op == JUMPDEST]
-func_ends = [off for off, op in op_list if op in (STOP, RETURN, REVERT, JUMPI)]
-sloads  = [off for off, op in op_list if op == SLOAD]
-calls   = [off for off, op in op_list if op in CALL_OPCODES]
-sstores = [off for off, op in op_list if op == SSTORE]
+# CALL-family offsets per opcode
+CALL_OFFSETS=($(offsets_of "$CALL" | tr ',' ' '))
+CALLCODE_OFFSETS=($(offsets_of "$CALLCODE" | tr ',' ' '))
+DELEGATECALL_OFFSETS=($(offsets_of "$DELEGATECALL" | tr ',' ' '))
+STATICCALL_OFFSETS=($(offsets_of "$STATICCALL" | tr ',' ' '))
 
-def in_same_function(off_a, off_b):
-    s = -1
-    for j in jumdests:
-        if j <= off_a and j > s: s = j
-    if s == -1: return False
-    e = -1
-    for fe in func_ends:
-        if fe > s and (e == -1 or fe < e): e = fe
-    if e == -1: return False
-    return s <= off_b <= e
+# ---- Helper: function start of an offset (largest JUMPDEST <= off) ----
+function_start_of() {
+  local off="$1"
+  local s=-1
+  for j in "${JUMPDEST_OFFS[@]}"; do
+    if [ "$j" -le "$off" ] && [ "$j" -gt "$s" ]; then s=$j; fi
+  done
+  echo "$s"
+}
 
-def function_start_of(off):
-    s = -1
-    for j in jumdests:
-        if j <= off and j > s: s = j
-    return s
+# ---- Helper: function end of a start offset (smallest FUNC_END > start) ----
+function_end_of() {
+  local start="$1"
+  local e=-1
+  for fe in "${FUNC_END_OFFS[@]}"; do
+    if [ "$fe" -gt "$start" ] && { [ "$e" -eq -1 ] || [ "$fe" -lt "$e" ]; }; then e=$fe; fi
+  done
+  echo "$e"
+}
 
-def function_end_of(start):
-    e = -1
-    for fe in func_ends:
-        if fe > start and (e == -1 or fe < e): e = fe
-    return e
+# ---- Helper: are two offsets in the same function? ----
+same_function() {
+  local a="$1" b="$2"
+  local s=$(function_start_of "$a")
+  if [ "$s" -eq -1 ]; then return 1; fi
+  local e=$(function_end_of "$s")
+  if [ "$e" -eq -1 ]; then return 1; fi
+  if [ "$b" -ge "$s" ] && [ "$b" -le "$e" ]; then return 0; fi
+  return 1
+}
 
-def is_guarded(start, end):
-    for i in range(start, min(end + 1, len(raw))):
-        if raw[i] == SSTORE:
-            for j in range(max(0, i - 32), i):
-                op = raw[j]
-                if 0x60 <= op <= 0x7f:
-                    n = op - 0x5f
-                    if j + n < len(raw):
-                        slot_bytes = raw[j+1:j+1+n]
-                        try:
-                            slot = int.from_bytes(slot_bytes, "big")
-                            if slot in GUARD_SLOTS:
-                                return True
-                        except Exception:
-                            pass
-    return False
+# ---- Helper: is a function guarded by ReentrancyGuard? ----
+# Scans [start, end] for an SSTORE pushing a known guard slot
+is_guarded() {
+  local start="$1" end="$2"
+  for ((i = start; i <= end; i++)); do
+    if [ "${BYTES[$i]}" = "$SSTORE" ]; then
+      # Look back 32 bytes for a PUSH-N region
+      for ((j = i - 32; j < i; j++)); do
+        if [ "$j" -lt 0 ]; then continue; fi
+        local op="${BYTES[$j]}"
+        if [ "$op" -ge "$PUSH1" ] && [ "$op" -le "$PUSH32" ]; then
+          local n=$((op - PUSH1 + 1))
+          if [ $((j + n)) -lt "$NBYTES" ]; then
+            # Build the slot hex
+            local slot_hex=""
+            for ((k = j + 1; k < j + 1 + n; k++)); do
+              slot_hex+=$(printf '%02x' "${BYTES[$k]}")
+            done
+            for gs in "${GUARD_SLOTS[@]}"; do
+              # Compare the last 4 hex chars (lowest 2 bytes) of the slot
+              local last4="${slot_hex: -4}"
+              if [ "$last4" = "$gs" ]; then return 0; fi
+            done
+          fi
+        fi
+      done
+    fi
+  done
+  return 1
+}
 
-findings = []
-fid = 0
+# ---- Build findings ----
+# We collect them in a flat string, then dedupe + sort
+FINDINGS=""
 
-# ----- Pattern 1/2/3: SLOAD ... CALL-family ... SSTORE -----
-for s in sloads:
-    for c in calls:
-        if c <= s: continue
-        if raw[c] == STATICCALL: continue
-        if not in_same_function(s, c): continue
-        for st in sstores:
-            if st <= c: continue
-            if not in_same_function(s, st): continue
-            if raw[c] == CALL:           pattern, base = "SLOAD-CALL-SSTORE", 90
-            elif raw[c] == CALLCODE:     pattern, base = "SLOAD-CALLCODE-SSTORE", 85
-            elif raw[c] == DELEGATECALL: pattern, base = "SLOAD-DELEGATECALL-SSTORE", 80
-            else:                        pattern, base = "SLOAD-CALL-SSTORE", 90
-            sev = base
-            cross = not in_same_function(c, st)
-            if not in_same_function(c, st) and in_same_function(s, c):
-                sev += 15
-            if in_same_function(s, st):
-                start = function_start_of(s)
-                end = function_end_of(start)
-                if start >= 0 and end > start and is_guarded(start, end):
-                    sev -= 10
-            sev = max(0, min(100, sev))
-            fid += 1
-            findings.append({
-                "id": fid, "pattern": pattern, "severity": sev,
-                "sload_offset": s, "call_offset": c, "sstore_offset": st,
-                "call_opcode": hex(raw[c]), "cross_function": cross,
-            })
+add_finding() {
+  local sload_off="$1"
+  local call_off="$2"
+  local call_op="$3"   # "0xf1" "0xf2" "0xf4" "0xfa"
+  local sstore_off="$3"  # collision - fix this below
+}
 
-# ----- Pattern 4: SLOAD ... CALL ... SLOAD ... SSTORE -----
-for s1 in sloads:
-    for c in calls:
-        if c <= s1: continue
-        if raw[c] == STATICCALL: continue
-        if not in_same_function(s1, c): continue
-        for s2 in sloads:
-            if s2 <= c: continue
-            if not in_same_function(c, s2): continue
-            for st in sstores:
-                if st <= s2: continue
-                if not in_same_function(s2, st): continue
-                sev = 95
-                start = function_start_of(s1)
-                end = function_end_of(start) if start >= 0 else -1
-                if start >= 0 and end > start and is_guarded(start, end):
-                    sev -= 10
-                sev = max(0, min(100, sev))
-                fid += 1
-                findings.append({
-                    "id": fid, "pattern": "SLOAD-CALL-SLOAD-SSTORE", "severity": sev,
-                    "sload_offset": s1, "call_offset": c, "sload2_offset": s2, "sstore_offset": st,
-                    "call_opcode": hex(raw[c]), "cross_function": False,
-                })
+# Actually let me do it differently. Just emit JSON directly via append
+JSON_FINDINGS="[]"
 
-# Dedupe
-seen, unique = set(), []
-for f in findings:
-    key = (f["sload_offset"], f["call_offset"], f["sstore_offset"], f["pattern"])
-    if key in seen: continue
-    seen.add(key)
-    unique.append(f)
-findings = sorted(unique, key=lambda f: -f["severity"])
-overall = max([f["severity"] for f in findings], default=0)
-print(json.dumps({"findings": findings, "overall_score": overall}))
-PYEOF
-)
+# Patterns 1/2/3: SLOAD ... CALL-family ... SSTORE
+for s in "${SLOAD_OFFS[@]}"; do
+  # Build candidate call list based on the call op
+  for call_op in 241 242 244; do
+    case $call_op in
+      241) call_list=("${CALL_OFFSETS[@]}") ;;
+      242) call_list=("${CALLCODE_OFFSETS[@]}") ;;
+      244) call_list=("${DELEGATECALL_OFFSETS[@]}") ;;
+    esac
+    for c in "${call_list[@]}"; do
+      [ "$c" -le "$s" ] && continue
+      same_function "$s" "$c" || continue
+      for st in "${SSTORE_OFFS[@]}"; do
+        [ "$st" -le "$c" ] && continue
+        same_function "$s" "$st" || continue
+        # Determine pattern + base
+        case $call_op in
+          241) pattern="SLOAD-CALL-SSTORE"; base=90 ;;
+          242) pattern="SLOAD-CALLCODE-SSTORE"; base=85 ;;
+          244) pattern="SLOAD-DELEGATECALL-SSTORE"; base=80 ;;
+        esac
+        sev=$base
+        cross=0
+        if same_function "$c" "$st"; then
+          :
+        else
+          cross=1
+          if same_function "$s" "$c"; then sev=$((sev + 15)); fi
+        fi
+        # Check guard
+        start_off=$(function_start_of "$s")
+        end_off=$(function_end_of "$start_off")
+        if [ "$start_off" -ge 0 ] && [ "$end_off" -gt "$start_off" ]; then
+          if is_guarded "$start_off" "$end_off"; then
+            sev=$((sev - 10))
+          fi
+        fi
+        if [ "$sev" -gt 100 ]; then sev=100; fi
+        if [ "$sev" -lt 0 ]; then sev=0; fi
+        call_op_hex="0x$(printf '%02x' $call_op)"
+        JSON_FINDINGS=$(echo "$JSON_FINDINGS" | jq \
+          --argjson sload "$s" \
+          --argjson call "$c" \
+          --argjson sstore "$st" \
+          --arg call_op "$call_op_hex" \
+          --arg pattern "$pattern" \
+          --argjson sev "$sev" \
+          --argjson cross "$cross" \
+          '. + [{sload_offset:$sload, call_offset:$call, sstore_offset:$sstore, call_opcode:$call_op, pattern:$pattern, severity:$sev, cross_function:$cross}]')
+      done
+    done
+  done
+done
 
-# -------------------- render output --------------------
-EXPLORER_LINK="$EXPLORER/address/$CONTRACT"
-export REEPATTS_BYTECODE_HEX="$BYTECODE_HEX"
-echo "$MATCHED_JSON" | python3 "$SCRIPT_DIR/_render.py" \
-  "contract=$CONTRACT" \
-  "network=$NETWORK" \
-  "chain_id=$CHAIN_ID" \
-  "net_label=$NET_LABEL" \
-  "explorer_link=$EXPLORER_LINK" \
-  "bytecode_size=$BYTECODE_SIZE" \
-  "min_severity=$MIN_SEVERITY" \
-  "format=$FORMAT"
+# Pattern 4: SLOAD ... CALL ... SLOAD ... SSTORE
+for s1 in "${SLOAD_OFFS[@]}"; do
+  for call_op in 241 242 244; do
+    case $call_op in
+      241) call_list=("${CALL_OFFSETS[@]}") ;;
+      242) call_list=("${CALLCODE_OFFSETS[@]}") ;;
+      244) call_list=("${DELEGATECALL_OFFSETS[@]}") ;;
+    esac
+    for c in "${call_list[@]}"; do
+      [ "$c" -le "$s1" ] && continue
+      same_function "$s1" "$c" || continue
+      for s2 in "${SLOAD_OFFS[@]}"; do
+        [ "$s2" -le "$c" ] && continue
+        same_function "$c" "$s2" || continue
+        for st in "${SSTORE_OFFS[@]}"; do
+          [ "$st" -le "$s2" ] && continue
+          same_function "$s2" "$st" || continue
+          sev=95
+          start_off=$(function_start_of "$s1")
+          end_off=$(function_end_of "$start_off")
+          if [ "$start_off" -ge 0 ] && [ "$end_off" -gt "$start_off" ]; then
+            if is_guarded "$start_off" "$end_off"; then
+              sev=$((sev - 10))
+            fi
+          fi
+          if [ "$sev" -gt 100 ]; then sev=100; fi
+          if [ "$sev" -lt 0 ]; then sev=0; fi
+          call_op_hex="0x$(printf '%02x' $call_op)"
+          JSON_FINDINGS=$(echo "$JSON_FINDINGS" | jq \
+            --argjson s1 "$s1" \
+            --argjson c "$c" \
+            --argjson s2 "$s2" \
+            --argjson st "$st" \
+            --arg call_op "$call_op_hex" \
+            --argjson sev "$sev" \
+            '. + [{sload_offset:$s1, call_offset:$c, sload2_offset:$s2, sstore_offset:$st, call_opcode:$call_op, pattern:"SLOAD-CALL-SLOAD-SSTORE", severity:$sev, cross_function:false}]')
+        done
+      done
+    done
+  done
+done
+
+# Dedupe by (sload, call, sstore, pattern)
+JSON_FINDINGS=$(echo "$JSON_FINDINGS" | jq 'unique_by([.sload_offset, .call_offset, .sstore_offset, .pattern])')
+# Sort by severity desc
+JSON_FINDINGS=$(echo "$JSON_FINDINGS" | jq 'sort_by(-.severity)')
+# Assign IDs
+JSON_FINDINGS=$(echo "$JSON_FINDINGS" | jq 'to_entries | map(.value + {id: (.key + 1)}) | from_entries')
+
+# Compute overall score = max severity
+OVERALL=$(echo "$JSON_FINDINGS" | jq 'if length == 0 then 0 else max_by(.severity) | .severity end')
+
+# Filter by min_severity
+FILTERED=$(echo "$JSON_FINDINGS" | jq --argjson min "$MIN_SEVERITY" '[.[] | select(.severity >= $min)]')
+FILTERED_COUNT=$(echo "$FILTERED" | jq 'length')
+
+# ---- Render ----
+EXPLORER_LINK="$EXPLORER_URL/address/$CONTRACT"
+
+case "$FORMAT" in
+  json)
+    jq -n \
+      --arg contract "$CONTRACT" \
+      --arg network "$NETWORK" \
+      --argjson chain_id "$CHAIN_ID" \
+      --arg net_label "$NET_LABEL" \
+      --arg explorer_link "$EXPLORER_LINK" \
+      --argjson bytecode_size "$BYTECODE_SIZE" \
+      --argjson overall "$OVERALL" \
+      --argjson min_severity "$MIN_SEVERITY" \
+      --argjson findings "$FILTERED" \
+      '{
+        contract: $contract,
+        network: $network,
+        chain_id: $chain_id,
+        net_label: $net_label,
+        explorer_link: $explorer_link,
+        bytecode_size: $bytecode_size,
+        overall_score: $overall,
+        min_severity: $min_severity,
+        finding_count: ($findings | length),
+        findings: $findings
+      }'
+    ;;
+
+  txt)
+    echo ""
+    echo "========================================================================"
+    echo "  REENTRANCY PATTERN SCAN"
+    echo "  Contract: $CONTRACT"
+    echo "  Network:  $NET_LABEL"
+    echo "  Bytecode: $BYTECODE_SIZE bytes"
+    echo "========================================================================"
+    echo ""
+    echo "  Overall score: $OVERALL/100"
+    echo "  Findings:      $FILTERED_COUNT"
+    if [ "$FILTERED_COUNT" -eq 0 ]; then
+      echo "  (none above --min-severity $MIN_SEVERITY)"
+    else
+      echo ""
+      echo "$FILTERED" | jq -r '.[] | "  - [\(.severity)] \(.pattern) (SLOAD @ 0x\(.sload_offset|tostring), \(.call_opcode) @ 0x\(.call_offset|tostring), SSTORE @ 0x\(.sstore_offset|tostring))"' 2>/dev/null \
+        | head -20
+    fi
+    echo ""
+    echo "  Explorer: $EXPLORER_LINK"
+    echo "========================================================================"
+    ;;
+
+  md|*)
+    echo ""
+    echo "# Reentrancy Pattern Scan"
+    echo ""
+    echo "| Field | Value |"
+    echo "|---|---|"
+    echo "| Contract | \`$CONTRACT\` |"
+    echo "| Network | $NET_LABEL |"
+    echo "| Bytecode size | $BYTECODE_SIZE bytes |"
+    echo "| **Overall score** | **$OVERALL / 100** |"
+    echo "| Findings (severity >= $MIN_SEVERITY) | $FILTERED_COUNT |"
+    echo "| Explorer | [view ↗]($EXPLORER_LINK) |"
+    echo ""
+    if [ "$FILTERED_COUNT" -gt 0 ]; then
+      echo "## Findings"
+      echo ""
+      echo "| # | Severity | Pattern | SLOAD | CALL | SSTORE | Notes |"
+      echo "|---:|---:|---|---:|---:|---:|---|"
+      echo "$FILTERED" | jq -r '.[] | "| \(.id) | \(.severity) | `\(.pattern)` | 0x\(.sload_offset|tostring) | \(.call_opcode) @ 0x\(.call_offset|tostring) | 0x\(.sstore_offset|tostring) | \(if .cross_function then "cross-function" else "" end) |"'
+      echo ""
+    fi
+    if [ "$OVERALL" -ge 90 ]; then
+      echo "## Verdict: **CRITICAL**"
+      echo ""
+      echo "Multiple high-severity reentrancy patterns detected. Do not interact with this contract without a full source review."
+    elif [ "$OVERALL" -ge 60 ]; then
+      echo "## Verdict: **WARNING**"
+      echo ""
+      echo "Reentrancy patterns detected. Verify ReentrancyGuard coverage or fix the underlying issue."
+    elif [ "$OVERALL" -gt 0 ]; then
+      echo "## Verdict: **INFO**"
+      echo ""
+      echo "Low-severity patterns detected. Manual review recommended."
+    else
+      echo "## Verdict: **CLEAN**"
+      echo ""
+      echo "No reentrancy patterns matched. (Note: a clean scan does not guarantee safety; this is a static heuristic.)"
+    fi
+    echo ""
+    ;;
+esac

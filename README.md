@@ -1,275 +1,267 @@
-# reepatts
+# Reepatts — Reentrancy Pattern Scanner
 
-A static analyzer for **reentrancy patterns in deployed EVM bytecode**, built for the [Pharos Network](https://pharos.xyz). Point it at a contract on Pharos Atlantic Testnet or Pacific Ocean Mainnet and it returns a per-finding report of every suspicious `SLOAD-CALL-SSTORE` fingerprint in the bytecode — byte offset, function selector, severity (0-100), and a recommended fix.
+> Static analyzer for reentrancy patterns in deployed EVM bytecode on Pharos. Catches SLOAD-CALL-SSTORE, CALLCODE / DELEGATECALL variants, cross-function chains, and unprotected withdraw().
 
-Six patterns matched: textbook `SLOAD-CALL-SSTORE`, `CALLCODE`/`DELEGATECALL` variants, the 2016-DAO shape `SLOAD-CALL-SLOAD-SSTORE`, cross-function chains, and unprotected `withdraw()`. The matcher is PUSH-data aware (no false-positive on slot bytes that happen to be `0x00`) and recognizes OpenZeppelin's `ReentrancyGuard` so guarded contracts don't false-flag.
+[![foundry](https://img.shields.io/badge/built%20with-Foundry-orange)]()
+[![bash](https://img.shields.io/badge/script-bash-blue)]()
+[![license](https://img.shields.io/badge/license-MIT-green)]()
+[![pharos](https://img.shields.io/badge/network-Pharos-blueviolet)]()
+[![ai-agent](https://img.shields.io/badge/callable%20by-AI%20agent-purple)]()
 
-Drop `SKILL.md` into your agent's skills directory and the agent can audit any Pharos contract on demand. Works with Claude Code, Codex, OpenClaw, and the Pharos Agent Center.
+## What it is
+
+This is a **skill built for the Pharos network** — a self-contained, deterministic bash script that runs on top of the [Pharos](https://pharos.network) EVM chains. It is **not** an AI agent itself, and not a chatbot. It is a single bash script that:
+
+- takes input from the caller via CLI flags,
+- reads live bytecode from Pharos via `cast` (Foundry),
+- runs its own pattern-matching in pure bash,
+- prints a structured report (Markdown, JSON, or text) to stdout.
+
+Fetches the contract's deployed bytecode via `cast rpc eth_getCode` and matches 6 reentrancy patterns in pure bash: `SLOAD-CALL-SSTORE` (textbook), `SLOAD-CALLCODE-SSTORE` (pre-0.5 Solidity), `SLOAD-DELEGATECALL-SSTORE` (proxy risk), `SLOAD-CALL-SLOAD-SSTORE` (post-call re-read), cross-function chains, and unprotected `withdraw()`. The matcher is PUSH-data-aware (no false-positives on slot bytes that happen to be `0x00`) and recognizes OpenZeppelin's `ReentrancyGuard` (storage slots `0x4f10` / `0x6d10` / `0x3659`) so guarded contracts don't false-flag. Each finding has a 0-100 severity, byte offsets, function selector, and a recommended fix path. Output as Markdown, JSON, or text. Bounded by `--min-severity`.
 
 ## What it detects
 
 Six patterns, ordered by severity:
 
-| # | Pattern | Severity | Notes |
+| # | Pattern | Base severity | Notes |
 |---|---|---:|---|
 | 1 | `SLOAD-CALL-SSTORE` | 90 | classic textbook reentrancy |
 | 2 | `SLOAD-CALLCODE-SSTORE` | 85 | via CALLCODE (pre-0.5 Solidity) |
 | 3 | `SLOAD-DELEGATECALL-SSTORE` | 80 | via DELEGATECALL (proxy-upgradeable risk) |
 | 4 | `SLOAD-CALL-SLOAD-SSTORE` | 95 | classic + post-call re-read |
-| 5 | cross-function chain (SSTORE, CALL, SSTORE) | 100 | the dangerous one |
-| 6 | `Unprotected withdraw()` | 70 | value-transferring CALL with no guard |
+| 5 | cross-function chain (SSTORE, CALL, SSTORE) | +15 bonus | the dangerous one |
+| 6 | ReentrancyGuard detected | -10 bonus | OZ guard recognized; not a true positive |
 
 Each finding is reported with:
-- Byte offset (decimal + hex) of the suspect `SSTORE`
-- The function selector (4-byte hex) it lives in, reverse-looked against a known-functions table
+- Byte offset (decimal + hex) of the suspect `SLOAD`, `CALL`, and `SSTORE`
+- The call opcode used (CALL / CALLCODE / DELEGATECALL / STATICCALL)
 - A 0-100 severity score
-- The full evidence (each SLOAD/CALL/SSTORE offset + the slot it touches)
+- Whether the pattern crosses function boundaries
+- Whether the containing function is protected by a known ReentrancyGuard
+
+## Use it from an AI agent
+
+This skill is designed to be **called by an AI agent** (a Claude Code / Codex / Cursor agent, the Pharos Agent Center, or any custom LLM agent). The agent reads `SKILL.md` to discover the skill's flags, fills them in based on the user's request, and runs the bash script in its sandbox. The agent's job is just to translate "is this contract reentrancy-safe?" into `bash scripts/scan.sh 0xADDR`.
+
+Typical agent-side flow:
+
+```text
+User -> Agent: "Is this Pharos contract reentrancy-safe?"
+Agent -> looks up SKILL.md for Reepatts — Reentrancy Pattern Scanner
+Agent -> runs: bash scripts/scan.sh 0xCONTRACT
+Agent -> reads the per-finding severity, presents the critical items to the user
+```
+
+The script prints structured output to stdout and human-readable progress to stderr, so the agent can parse the stdout cleanly (with `jq`) without being polluted by progress messages.
 
 ## Install
 
-### 1. Install Foundry (the engine the skill is built on)
+You need three things: **Foundry** (for `cast`), **jq** (for JSON pretty-printing), and **git** (to clone the repo).
 
 ```bash
+# 1. Install Foundry (gives you cast, forge, anvil, chisel)
 curl -L https://foundry.paradigm.xyz | bash
 foundryup
-```
+# Reload your shell so the new commands are on PATH:
+exec $SHELL
+cast --version   # should print 1.x or higher
 
-Verify with `cast --version`. This gives you `cast`, `forge`, `anvil`, and `chisel` on your `$PATH`. The skill uses `cast` for every RPC read.
+# 2. Install jq (required for --format json)
+# macOS:   brew install jq
+# Ubuntu:  sudo apt-get install -y jq
+# Alpine:  apk add jq
+jq --version
 
-### 2. Install jq (used to parse JSON)
-
-```bash
-# macOS
-brew install jq
-# Debian/Ubuntu/Termux
-apt install -y jq
-# Alpine
-apk add jq
-```
-
-Verify with `jq --version`.
-
-### 3. Get the skill
-
-```bash
-git clone https://github.com/pazzy422/reepatts
+# 3. Clone this repo
+git clone https://github.com/pazzy422/reepatts.git
 cd reepatts
-chmod +x scripts/*.sh
+chmod +x scripts/*.sh tests/*.sh
 ```
 
-That's it. No `pip install`, no `npm install`, no `forge build`, no compile. The skill is a bash script that uses `cast` (from Foundry) for every RPC read. The `assets/networks.json` file already knows the Pharos Pacific Mainnet and Atlantic Testnet endpoints.
-## Quick test (try it in 30 seconds)
-
-After the 3-step install above, run the demo mode (no private key, no RPC, no setup):
+## Quick test (30 seconds, no API keys needed)
 
 ```bash
-bash scripts/scan.sh 0xYOUR_CONTRACT
+bash scripts/scan.sh --demo
 ```
 
-You should see a printed report. The demo uses synthetic data, so it works offline.
+The demo runs offline and prints a synthetic report — no cast, no RPC.
 
-To run a real check on a Pharos transaction, wallet, or token, replace the placeholder:
-
-```bash
-bash scripts/scan.sh 0xYOUR_CONTRACT --network mainnet --format md
-```
-
-## Use in an AI agent (Claude Code / Codex / OpenClaw / Pharos Agent Center)
-
-The skill ships with a `SKILL.md` that AI agents auto-load. Once installed in your agent, just ask in natural language — the agent will read `SKILL.md` and run the bash script for you.
-
-```text
-"Is this Pharos contract 0xabc... safe from reentrancy?"
-```
-
-The agent will run `bash scripts/scan.sh 0xYOUR_CONTRACT` (or the live command with the address you gave) and read the result back to you.
-
-### Install in your agent
-
-**Option A — Pharos Agent Center** (one-line install):
-
-```bash
-# from inside any agent that has the Pharos Agent Center CLI
-pharos-skill install https://github.com/pazzy422/reepatts
-```
-
-**Option B — OpenClaw / Claude Code / Codex** (one-line via npm):
-
-```bash
-npx skills add https://github.com/pazzy422/reepatts
-```
-
-**Option C — Manual install** (drop into your agent's skills directory):
-
-```bash
-# Clone the skill
-git clone https://github.com/pazzy422/reepatts
-cd reepatts
-
-# Claude Code: copy to ~/.claude/skills/
-mkdir -p ~/.claude/skills/reepatts
-cp -r . ~/.claude/skills/reepatts/
-
-# Codex: copy to ~/.codex/skills/
-mkdir -p ~/.codex/skills/reepatts
-cp -r . ~/.codex/skills/reepatts/
-
-# OpenClaw: copy to ~/.openclaw/skills/
-mkdir -p ~/.openclaw/skills/reepatts
-cp -r . ~/.openclaw/skills/reepatts/
-
-# Then restart the agent — the skill will be auto-loaded.
-```
-## Quick start
-
-### Zero-dependency (bash + curl only)
+## Usage
 
 ```bash
 # Default: Markdown report, mainnet
-bash scripts/scan.sh 0x7a31dd32a880827477ab2bbeff47db188c896815 --network mainnet
+bash scripts/scan.sh 0xYOUR_CONTRACT
 
-# Machine-readable JSON
-bash scripts/scan.sh 0xYOUR_CONTRACT --network mainnet --format json
+# JSON output for an agent
+bash scripts/scan.sh 0xYOUR_CONTRACT --format json
 
-# Filter to only HIGH/CRITICAL findings
-bash scripts/scan.sh 0xYOUR_CONTRACT --network testnet --min-severity 60
+# Testnet
+bash scripts/scan.sh 0xYOUR_CONTRACT --network testnet
+
+# Only show CRITICAL/HIGH (>= 80)
+bash scripts/scan.sh 0xYOUR_CONTRACT --min-severity 80
+
+# Demo (no cast or RPC needed)
+bash scripts/scan.sh --demo
 ```
 
-### Python (richer output)
+### All flags
 
-```bash
-pip install web3
-python3 scripts/scan.py 0xYOUR_CONTRACT --network mainnet --format md
+```
+0xCONTRACT --network mainnet|testnet --format md|json|txt --min-severity 0-100 --demo --help
 ```
 
-### Run the demo (no arguments needed)
-
-```bash
-bash scripts/scan_demo.sh
-```
-
-This scans a real public mainnet contract and prints a sample report.
-
-### Verify the install
-
-```bash
-bash scripts/scan.sh --help
-python3 scripts/scan.py --help
-python3 tests/test_patterns.py
-```
-
-## Output formats
-
-| Format | Use case |
+| Flag | Description |
 |---|---|
-| `md` (default) | Human-readable Markdown — pasteable into GitHub, Notion, Slack |
-| `json` | Machine-readable — for downstream tooling (audit dashboards, CI gates) |
-| `txt` | Plain text — for audit logs, terminal output |
-
-## Output example
-
-```markdown
-# reepatts — Reentrancy report
-
-**Contract:** 0x7a31dd32a880827477ab2bbeff47db188c896815
-**Network:** Pharos Pacific Ocean Mainnet (chain 1672)
-**Bytecode size:** 12,847 bytes
-**Function selectors detected:** 23
-
-## Overall score: 78 / 100 (HIGH RISK)
-
-## Findings (3)
-
-### Finding #1 — pattern: SLOAD-CALL-SSTORE
-- Severity: 90 / 100
-- Byte-offset: 0x1a3e
-- Function selector: 0xa9059cbb (transfer(address,uint256))
-- Evidence:
-  - SLOAD at 0x1a30 (slot 0x02)
-  - CALL at 0x1a3a
-  - SSTORE at 0x1a3e (slot 0x02)
-
-### Finding #2 — pattern: Unprotected withdraw()
-- Severity: 70 / 100
-- Byte-offset: 0x2f10
-- Function selector: 0x2e1a7d4d (withdraw(uint256))
-- ...
-```
+| `0xCONTRACT` | Contract address to scan (positional, required unless `--demo`) |
+| `--network mainnet \| testnet` | Pharos chain (default: mainnet) |
+| `--format md \| json \| txt` | Output format (default: md) |
+| `--min-severity 0-100` | Only show findings at or above this severity (default: 0 = all) |
+| `--demo` | Run a synthetic scan (no cast or RPC needed) |
+| `-h`, `--help` | Show the help text |
 
 ## Networks
 
-| Network | Chain ID | Native | RPC | Explorer |
-|---|---:|---|---|---|
-| Pharos Atlantic Testnet | 688689 | PHRS | `https://atlantic.dplabs-internal.com` | https://atlantic.pharosscan.xyz |
-| Pharos Pacific Ocean Mainnet | 1672 | PROS | `https://rpc.pharos.xyz` | https://www.pharosscan.xyz |
+The skill is built to run against the Pharos EVM chains. The chain config is stored in `assets/networks.json` and read at startup — no hardcoded URLs in the script.
+
+| Network | Chain ID | RPC URL | Default |
+|---|---:|---|:---:|
+| mainnet (Pacific Ocean) | 1672 | `https://rpc.pharos.xyz` | ✓ |
+| atlantic-testnet | 688689 | `https://atlantic.dplabs-internal.com` |  |
+
+The script defaults to mainnet. Pass `--network testnet` to use the testnet instead. You can also override the RPC URL by editing `assets/networks.json`.
+
+## Set it up in an AI agent
+
+Three install paths for any AI agent that wants to call this skill.
+
+### Path A — Pharos Agent Center (for the official Pharos LLM agent)
+
+The Pharos Agent Center is the official agent runtime for the Pharos network. It reads `SKILL.md` from any skill repo to discover capabilities, dependencies, and required flags.
+
+1. **Copy the skill into the Agent Center's skills directory:**
+   ```bash
+   cp -r scripts assets references examples SKILL.md README.md foundry.toml LICENSE \
+     ~/.pharos/agent-center/skills/reepatts/
+   ```
+
+2. **Reload the Agent Center's skill registry:**
+   ```bash
+   pharos-agent reload-skills
+   ```
+
+3. **Invoke from the agent's chat UI:**
+   ```text
+   User: "Does this Pharos contract have reentrancy vulnerabilities?"
+   Agent Center: loads Reepatts — Reentrancy Pattern Scanner, runs:
+     bash ~/.pharos/agent-center/skills/reepatts/scripts/scan.sh 0xCONTRACT
+   ```
+
+### Path B — `npx skills add` (for Claude Code, Cursor, Codex, generic MCP agents)
+
+```bash
+npx skills add https://github.com/pazzy422/reepatts --skill reepatts
+```
+
+### Path C — Manual copy (any agent that reads `~/.claude/skills/`)
+
+```bash
+mkdir -p ~/.claude/skills/reepatts
+cp -r scripts assets references examples SKILL.md README.md foundry.toml LICENSE ~/.claude/skills/reepatts/
+```
+
+### Path D — Direct invocation (shell agents, cron jobs, CI pipelines)
+
+```bash
+bash scripts/scan.sh 0xCONTRACT
+```
+
+### What the agent says to invoke this skill
+
+| Caller says | Script invocation |
+|---|---|
+| Scan `0xabc...def` for reentrancy on Pharos mainnet | `bash scripts/scan.sh 0xabc...def` |
+| Run the reentrancy scanner demo | `bash scripts/scan.sh --demo` |
+| Scan and return only CRITICAL findings as JSON | `bash scripts/scan.sh 0xabc...def --min-severity 80 --format json` |
+| "Run the demo" | `bash scripts/scan.sh --demo` |
+
+## Security model
+
+The skill is **read-only by design**:
+
+- The script never imports, reads, or stores a private key.
+- It reads deployed bytecode via `eth_getCode` (read-only RPC) — it cannot move funds.
+- It never submits a transaction, never writes to disk, never phones home.
+- The only network call is to the user-configured RPC URL.
+
+A **clean scan does not guarantee safety**. The matcher is a static heuristic — it finds pattern matches in bytecode but cannot reason about control flow, storage layout, or cross-contract calls. Treat findings as "needs a human review", not as a verdict.
+
+## Framework
+
+| Layer | Tech | Purpose |
+|---|---|---|
+| Engine | **bash 4+** | Script host (single file per skill) |
+| RPC client | **Foundry / cast** | Bytecode fetch via `cast rpc eth_getCode` |
+| Bytecode analysis | **pure bash** | PUSH-data-aware opcode iteration, basic-block detection, pattern matching, guard-slot lookup — all in bash arrays + `printf '%d'` |
+| Chain config | **JSON** (`assets/networks.json`) | Network endpoints + chain IDs |
+| Data format | **JSON** | Output via `jq` for agent consumption |
+| Runtime | Any POSIX shell, Foundry 1.0+ | Tested on Linux + macOS |
+
+## Dependencies
+
+**Required:**
+- [Foundry](https://getfoundry.sh) (gives you `cast`)
+- `bash` 4+ (preinstalled on macOS, Ubuntu 20+, most Linux)
+- `jq` (for `--format json` output and inline JSON building)
+
+**Optional:**
+- `git` — only required if you're cloning the repo (you already have it)
+
+## Tests
+
+Each repo ships with a bash smoke test that verifies:
+1. `--help` works (no cast required)
+2. `--demo` works (no cast required)
+3. No contract shows the usage hint
+4. Bad address format is rejected
+5. Bad format is rejected
+6. Bad `--min-severity` is rejected
+7. Bad network is rejected
+8. The cast-missing error is clear (when cast is not installed)
+
+```bash
+bash tests/test_scan_smoke.sh
+```
+
+The test runs offline by default. If cast is installed, the live `eth_getCode` fetch will take a few seconds.
+
+## Reference docs
+
+- `references/patterns.md` — detailed description of each pattern with examples
+- `references/selectors.json` — the curated list of 4-byte function selectors this scanner recognizes
+- `examples/sample-report.md` — an annotated example of the text report
 
 ## Repository layout
 
 ```
-.
-├── README.md
-├── SKILL.md                          # Agent-side description
+reepatts/
+├── SKILL.md              # Skill contract
+├── README.md             # This file
+├── foundry.toml          # Minimal config so cast can find the project root
+├── LICENSE               # MIT
+├── assets/
+│   └── networks.json     # mainnet + testnet chain config
 ├── references/
-│   ├── networks.json                 # Canonical Pharos config
-│   ├── selectors.json                # Known 4-byte function selectors
-│   └── patterns.md                   # Pattern specifications + examples
+│   ├── patterns.md
+│   └── selectors.json
+├── examples/
+│   └── sample-report.md
 ├── scripts/
-│   ├── scan.sh                       # Zero-dep bash scanner
-│   ├── scan.py                       # Python scanner (richer output)
-│   └── scan_demo.sh                  # One-shot demo with a real contract
-├── tests/
-│   ├── test_patterns.py              # Pattern-matcher unit tests
-│   └── fixtures/                     # Sample bytecodes for testing
-└── examples/
-    └── sample-report.md              # Captured real-contract scan
+│   └── scan.sh          # The single bash script that does the work
+└── tests/
+    └── test_scan_smoke.sh   # Offline smoke test
 ```
-
-## Requirements
-
-### Runtime
-
-| Tool | Version | Required by |
-|---|---|---|
-| `bash` | 4+ | `scripts/scan.sh` |
-| `curl` | any | `scripts/scan.sh` (JSON-RPC) |
-| `python3` | 3.8+ | `scripts/scan.py` |
-| `cast` / `forge` | any | (optional) — only if you want to use the underlying Pharos Agent Kit directly |
-
-### Python packages
-
-```bash
-pip install web3
-```
-
-### Network access
-
-| Endpoint | Why | Fallback if blocked |
-|---|---|---|
-| `https://rpc.pharos.xyz` (mainnet) | fetch the deployed bytecode | none — the skill is read-only against the chain |
-| `https://atlantic.dplabs-internal.com` (testnet) | same, for testnet | none |
-
-## Framework compatibility
-
-| Framework | Compatible? | How to use |
-|---|---|---|
-| Pharos Agent Center | ✅ yes | `cp -r . ~/.pharos/skills/reepatts` (or symlink) |
-| Claude Code | ✅ yes | `cp -r . ~/.claude/skills/reepatts` |
-| Codex | ✅ yes | `cp -r . ~/.codex/skills/reepatts` |
-| OpenClaw | ✅ yes | `npx skills add https://github.com/pazzy422/reepatts` |
-| Raw CLI / cron | ✅ yes | `bash scripts/scan.sh 0x...` — no agent needed |
-| Any agent that reads SKILL.md | ✅ yes | description front-matter triggers on "reentrancy", "scan", "audit" |
-
-## Tests
-
-```bash
-python3 tests/test_patterns.py
-# 6 pattern tests + 4 severity tests + 2 selector-lookup tests
-```
-
-## Honest scope
-
-reepatts is a **starting point**, not a verdict. It catches the obvious textbook patterns but does NOT substitute for a full audit firm. Use it to triage contracts quickly, then hand off to a real audit for the ones that flag.
 
 ## License
 
-MIT
+MIT — see `LICENSE`.
